@@ -1,0 +1,945 @@
+import {
+  WebSocketGateway,
+  SubscribeMessage,
+  MessageBody,
+  OnGatewayInit,
+  OnGatewayConnection,
+  OnGatewayDisconnect,
+  WebSocketServer,
+} from '@nestjs/websockets';
+import { Server, Socket } from 'socket.io';
+import { Inject, OnModuleInit } from '@nestjs/common';
+import { MessageStatus } from '@prisma/client';
+import * as jwt from 'jsonwebtoken';
+import appConfig from '../../../config/app.config';
+import { ChatRepository } from 'src/common/repository/chat/chat.repository';
+import { AppointmentRepository } from 'src/common/repository/appointment/appointment.repository';
+import { MissedCallRepository } from 'src/common/repository/missed-call/missed-call.repository';
+import { RecordingService } from 'src/modules/recording/recording.service';
+import { RecordingGateway } from 'src/modules/recording/recording.gateway';
+
+@WebSocketGateway({
+  cors: {
+    origin: '*',
+  },
+})
+export class MessageGateway
+  implements
+    OnGatewayInit,
+    OnGatewayConnection,
+    OnGatewayDisconnect,
+    OnModuleInit
+{
+  @WebSocketServer()
+  server: Server;
+
+  constructor(
+    private readonly recordingService: RecordingService,
+    @Inject('RECORDING_GATEWAY')
+    private readonly recordingGateway: RecordingGateway,
+  ) {}
+
+  // Map to store connected clients
+  public clients = new Map<string, string>(); // userId -> socketId
+
+  // Map to store socket to user mapping (for reverse lookup)
+  private socketToUser = new Map<string, string>(); // socketId -> userId
+
+  // Call state management
+  private activeCalls = new Map<
+    string,
+    {
+      caller: string;
+      receiver: string;
+      startTime: Date;
+      appointmentId: string;
+      callTimeout?: NodeJS.Timeout;
+    }
+  >();
+
+  // Call request timeouts (for unanswered calls)
+  private callRequests = new Map<
+    string,
+    {
+      timeout: NodeJS.Timeout;
+      caller: string;
+      receiver: string;
+      appointmentId: string;
+    }
+  >();
+
+  // Timeouts for disconnected users
+  private disconnectTimeouts = new Map<string, NodeJS.Timeout>();
+
+  onModuleInit() {}
+
+  afterInit(server: Server) {
+    console.log('Websocket server started');
+  }
+
+  // implement jwt token validation
+  async handleConnection(client: Socket, ...args: any[]) {
+    try {
+      console.log('=== New Connection ===');
+      console.log('Client ID:', client.id);
+
+      // Get token from either auth or query
+      const authToken = client.handshake.auth.token;
+      const queryToken = client.handshake.query.token as string;
+      const token = authToken || queryToken;
+
+      if (!token) {
+        console.error('No token provided');
+        client.disconnect();
+        return;
+      }
+
+      const decoded: any = jwt.verify(token, appConfig().jwt.secret);
+      const userId = decoded.sub;
+
+      if (!userId) {
+        console.error('Invalid token - no user ID');
+        client.disconnect();
+        return;
+      }
+
+      // Store the mappings
+      this.clients.set(userId, client.id);
+      this.socketToUser.set(client.id, userId);
+
+      console.log('Connection established:', {
+        userId,
+        socketId: client.id,
+        clients: Object.fromEntries(this.clients),
+        socketToUser: Object.fromEntries(this.socketToUser),
+      });
+
+      // Notify others that the user is online
+      this.server.emit('userStatusChange', {
+        user_id: userId,
+        status: 'online',
+      });
+    } catch (error) {
+      console.error('Connection error:', error);
+      client.disconnect();
+    }
+  }
+
+  // In handleDisconnect method
+  handleDisconnect(client: Socket) {
+    try {
+      // Find the user ID associated with this socket using the reverse mapping
+      const userId = this.socketToUser.get(client.id);
+
+      if (userId) {
+        console.log(`User ${userId} disconnected from socket ${client.id}`);
+
+        // Remove the socket-to-user mapping
+        this.socketToUser.delete(client.id);
+
+        // Only update user status and remove from clients if this was their last socket
+        const hasOtherSockets = [...this.socketToUser.entries()].some(
+          ([, id]) => id === userId,
+        );
+
+        if (!hasOtherSockets) {
+          this.clients.delete(userId);
+          console.log(
+            `User ${userId} has no more active connections, marking as offline`,
+          );
+
+          // Find any active calls involving this user
+          const activeCalls = [...this.activeCalls.entries()].filter(
+            ([, call]) => call.caller === userId || call.receiver === userId,
+          );
+
+          // End each call
+          for (const [callId, call] of activeCalls) {
+            const otherPartyId =
+              call.caller === userId ? call.receiver : call.caller;
+            const otherPartySocketId = this.clients.get(otherPartyId);
+
+            // Clear any timeouts
+            if (call.callTimeout) {
+              clearTimeout(call.callTimeout);
+            }
+
+            // Remove the call
+            this.activeCalls.delete(callId);
+
+            // Notify the other party if they're still connected
+            if (otherPartySocketId) {
+              this.server.to(otherPartySocketId).emit('callEnded', {
+                callId,
+                appointmentId: call.appointmentId,
+                endedBy: 'disconnect',
+                message: 'The other participant disconnected',
+              });
+            }
+          }
+
+          // Also clean up any pending call requests
+          const pendingRequests = [...this.callRequests.entries()].filter(
+            ([, request]) =>
+              request.caller === userId || request.receiver === userId,
+          );
+
+          for (const [callId, request] of pendingRequests) {
+            // Clear the timeout
+            clearTimeout(request.timeout);
+            this.callRequests.delete(callId);
+
+            // If this user was the caller, notify the receiver that the call was canceled
+            if (request.caller === userId) {
+              const receiverSocketId = this.clients.get(request.receiver);
+              if (receiverSocketId) {
+                this.server.to(receiverSocketId).emit('callCanceled', {
+                  callId,
+                  reason: 'Caller disconnected',
+                });
+              }
+            }
+          }
+        } else {
+          console.log(
+            `User ${userId} still has other active connections, not marking as offline`,
+          );
+        }
+      }
+    } catch (error) {
+      console.error('Error in handleDisconnect:', error);
+    }
+  }
+
+  @SubscribeMessage('joinRoom')
+  handleRoomJoin(client: Socket, body: { room_id: string }) {
+    const roomId = body.room_id;
+
+    client.join(roomId); // join the room using user_id
+    client.emit('joinedRoom', { room_id: roomId });
+  }
+
+  @SubscribeMessage('sendMessage')
+  async listenForMessages(
+    client: Socket,
+    @MessageBody() body: { to: string; data: any },
+  ) {
+    const recipientSocketId = this.clients.get(body.to);
+    if (recipientSocketId) {
+      this.server.to(recipientSocketId).emit('message', {
+        from: body.data.sender.id,
+        data: body.data,
+      });
+    }
+  }
+
+  @SubscribeMessage('updateMessageStatus')
+  async updateMessageStatus(
+    client: Socket,
+    @MessageBody() body: { message_id: string; status: MessageStatus },
+  ) {
+    await ChatRepository.updateMessageStatus(body.message_id, body.status);
+    // notify the sender that the message has been sent
+    this.server.emit('messageStatusUpdated', {
+      message_id: body.message_id,
+      status: body.status,
+    });
+  }
+
+  @SubscribeMessage('typing')
+  handleTyping(client: Socket, @MessageBody() body: { to: string; data: any }) {
+    console.log('=== Typing Event Debug ===');
+    console.log('Body:', body);
+    console.log('Socket to User Map:', Object.fromEntries(this.socketToUser));
+    console.log('Clients Map:', Object.fromEntries(this.clients));
+
+    try {
+      // 1. Find the socket ID from the clients map using the recipient ID
+      const recipientSocketId = this.clients.get(body.to);
+      if (!recipientSocketId) {
+        console.error('Recipient not found:', body.to);
+        return;
+      }
+
+      // 2. Find the sender's user ID from the socket mappings
+      // We need to find the socket ID that corresponds to the sender
+      let senderSocketId: string | undefined;
+      let senderUserId: string | undefined;
+
+      // Iterate through socketToUser map to find the sender
+      for (const [socketId, userId] of this.socketToUser.entries()) {
+        if (userId === body.to) {
+          senderSocketId = socketId;
+          senderUserId = userId;
+          break;
+        }
+      }
+
+      if (!senderUserId) {
+        console.error('Could not find sender user ID');
+        return;
+      }
+
+      // 3. Prepare and send typing event
+      const typingEvent = {
+        from: senderUserId,
+        data: {
+          ...body.data,
+          timestamp: new Date().toISOString(),
+        },
+      };
+
+      console.log('Sending typing event:', typingEvent);
+
+      // 4. Emit to recipient
+      this.server.to(recipientSocketId).emit('userTyping', typingEvent);
+    } catch (error) {
+      console.error('Error in handleTyping:', error);
+      console.error('Error stack:', error.stack);
+    }
+  }
+
+  @SubscribeMessage('stopTyping')
+  handleStopTyping(
+    client: Socket,
+    @MessageBody() body: { to: string; data: any },
+  ) {
+    console.log('=== Stop Typing Event Debug ===');
+    console.log('Body:', body);
+    console.log('Socket to User Map:', Object.fromEntries(this.socketToUser));
+    console.log('Clients Map:', Object.fromEntries(this.clients));
+
+    try {
+      // 1. Find the socket ID from the clients map using the recipient ID
+      const recipientSocketId = this.clients.get(body.to);
+      if (!recipientSocketId) {
+        console.error('Recipient not found:', body.to);
+        return;
+      }
+
+      // 2. Find the sender's user ID from the socket mappings
+      let senderUserId: string | undefined;
+
+      // Iterate through socketToUser map to find the sender
+      for (const [socketId, userId] of this.socketToUser.entries()) {
+        if (userId === body.to) {
+          senderUserId = userId;
+          break;
+        }
+      }
+
+      if (!senderUserId) {
+        console.error('Could not find sender user ID');
+        return;
+      }
+
+      // 3. Prepare and send stop typing event
+      const stopTypingEvent = {
+        from: senderUserId,
+        data: {
+          ...body.data,
+          timestamp: new Date().toISOString(),
+        },
+      };
+
+      console.log('Sending stop typing event:', stopTypingEvent);
+
+      // 4. Emit to recipient
+      this.server
+        .to(recipientSocketId)
+        .emit('userStoppedTyping', stopTypingEvent);
+    } catch (error) {
+      console.error('Error in handleStopTyping:', error);
+      console.error('Error stack:', error.stack);
+    }
+  }
+
+  // for calling
+  // Replace the current handleJoin method
+  @SubscribeMessage('join')
+  async handleJoin(
+    client: Socket,
+    { appointmentId }: { appointmentId: string },
+  ) {
+    try {
+      // Get user ID from the client's socket data (set during handleConnection)
+      const userId = [...this.clients.entries()].find(
+        ([, socketId]) => socketId === client.id,
+      )?.[0];
+
+      if (!userId) {
+        client.emit('joinError', {
+          message: 'Authentication required. Please login again.',
+        });
+        return;
+      }
+
+      // Validate appointment access
+      const validation = await AppointmentRepository.validateCallAccess(
+        appointmentId,
+        userId,
+      );
+
+      if (!validation.success) {
+        client.emit('joinError', {
+          message: validation.message,
+          startTime: validation.startTime,
+        });
+        return;
+      }
+
+      console.log(
+        `User ${userId} joined call system with appointment ${appointmentId}`,
+      );
+
+      // Join the appointment room for call notifications
+      client.join(`appointment-${appointmentId}`);
+
+      client.emit('joinedCall', {
+        success: true,
+        message: 'Successfully joined call system',
+        appointment: validation.appointment,
+      });
+    } catch (error) {
+      console.error('Error in handleJoin:', error);
+      client.emit('joinError', {
+        message: 'Failed to join call system. Please try again.',
+      });
+    }
+  }
+
+  @SubscribeMessage('call')
+  async handleCall(
+    client: Socket,
+    {
+      appointmentId,
+      receiver,
+      offer,
+    }: { appointmentId: string; receiver: string; offer: any },
+  ) {
+    try {
+      // Get caller ID from the socket-to-user mapping
+      const callerId = this.socketToUser.get(client.id);
+
+      // Enhanced logging for call attempt
+      console.log(`Call attempt from socket ${client.id}`);
+      console.log(`Caller ID resolved to: ${callerId || 'not found'}`);
+      console.log(`Attempting to call receiver: ${receiver}`);
+
+      if (!callerId) {
+        client.emit('callError', {
+          message: 'Authentication required. Please login again.',
+        });
+        return;
+      }
+
+      // Check if caller is already in a call
+      const existingCallerCall = [...this.activeCalls.entries()].find(
+        ([, call]) => call.caller === callerId || call.receiver === callerId,
+      );
+
+      if (existingCallerCall) {
+        client.emit('callError', {
+          message: 'You are already in another call. Please end it first.',
+        });
+        return;
+      }
+
+      // Check if receiver is already in a call
+      const existingReceiverCall = [...this.activeCalls.entries()].find(
+        ([, call]) => call.caller === receiver || call.receiver === receiver,
+      );
+
+      if (existingReceiverCall) {
+        client.emit('callError', {
+          message: 'Recipient is already in another call.',
+        });
+        return;
+      }
+
+      // Get the appointment to determine roles
+      const appointment =
+        await AppointmentRepository.getAppointmentWithUsers(appointmentId);
+
+      if (!appointment) {
+        client.emit('callError', {
+          message: 'Appointment not found.',
+        });
+        return;
+      }
+
+      const isDoctorCalling = appointment.service.user_id === callerId;
+      const isPatientCalling = appointment.user_id === callerId;
+
+      // Validate call access based on role
+      let validation;
+      let missedCallId;
+
+      if (isDoctorCalling) {
+        // Doctor is calling patient
+        validation = await AppointmentRepository.validateDoctorCallAccess(
+          appointmentId,
+          callerId,
+        );
+      } else if (isPatientCalling) {
+        // Patient is calling doctor
+        validation = await AppointmentRepository.validatePatientCallbackAccess(
+          appointmentId,
+          callerId,
+        );
+
+        if (validation.success) {
+          missedCallId = validation.missedCallId;
+        }
+      } else {
+        // Neither doctor nor patient
+        client.emit('callError', {
+          message: 'You are not authorized for this appointment.',
+        });
+        return;
+      }
+
+      if (!validation.success) {
+        client.emit('callError', {
+          message: validation.message,
+          startTime: validation.startTime,
+        });
+        return;
+      }
+
+      const receiverSocketId = this.clients.get(receiver);
+      if (receiverSocketId) {
+        // Generate a unique call ID
+        const callId = `call-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+        // Initialize recording state
+        await this.recordingGateway.initializeRecording(appointmentId);
+
+        // Set a timeout for call request (30 seconds)
+        const timeout = setTimeout(() => {
+          // If call wasn't answered within 30 seconds
+          this.callRequests.delete(callId);
+
+          // Notify the caller that the call was not answered
+          client.emit('callNotAnswered', {
+            callId,
+            receiver,
+            message: 'Call not answered. Recipient may be unavailable.',
+          });
+
+          // If doctor was calling, create a missed call record
+          if (isDoctorCalling) {
+            // Create missed call record
+            MissedCallRepository.createMissedCall(
+              appointmentId,
+              callerId, // doctor_id
+              receiver, // patient_id
+            )
+              .then(() => {
+                console.log(
+                  `Created missed call record for appointment ${appointmentId}`,
+                );
+              })
+              .catch((error) => {
+                console.error('Error creating missed call record:', error);
+              });
+          }
+
+          // Notify receiver that call was missed
+          const receiverSocketId = this.clients.get(receiver);
+          if (receiverSocketId) {
+            this.server.to(receiverSocketId).emit('missedCall', {
+              caller: callerId,
+              appointmentId,
+              isDoctorCall: isDoctorCalling,
+              message: `You missed a call from your ${isDoctorCalling ? 'doctor' : 'patient'}`,
+            });
+
+            // Also notify the receiver to stop ringing if they're still showing the call UI
+            this.server.to(receiverSocketId).emit('callCancelled', {
+              callId,
+              reason: 'Call timed out and was marked as missed',
+            });
+          }
+        }, 30000); // 30 seconds timeout
+
+        // Store the call request
+        this.callRequests.set(callId, {
+          timeout,
+          caller: callerId,
+          receiver,
+          appointmentId,
+        });
+
+        // If patient is calling back, mark the missed call as used
+        if (isPatientCalling && missedCallId) {
+          await MissedCallRepository.markCallbackUsed(missedCallId);
+        }
+
+        // Send call request to receiver
+        console.log(`Sending incomingCall event to socket ${receiverSocketId}`);
+        this.server.to(receiverSocketId).emit('incomingCall', {
+          callId,
+          caller: callerId,
+          appointmentId,
+          offer,
+          isDoctorCall: isDoctorCalling,
+        });
+
+        // Notify caller that call is ringing
+        client.emit('callRinging', {
+          callId,
+          receiver,
+        });
+      } else {
+        console.log(`Receiver ${receiver} is not online. No socket ID found.`);
+        client.emit('callError', {
+          message: 'Recipient is not online or not available.',
+        });
+      }
+    } catch (error) {
+      console.error('Error in handleCall:', error);
+      client.emit('callError', {
+        message: 'Failed to initiate call. Please try again.',
+      });
+    }
+  }
+
+  // Add a new method to handle call rejection
+  @SubscribeMessage('rejectCall')
+  handleRejectCall(
+    client: Socket,
+    { callId, reason = 'Call rejected' }: { callId: string; reason?: string },
+  ) {
+    try {
+      // Get receiver ID from the client's socket data
+      const receiverId = [...this.clients.entries()].find(
+        ([, socketId]) => socketId === client.id,
+      )?.[0];
+
+      if (!receiverId) {
+        return;
+      }
+
+      // Find the call request
+      const callRequest = this.callRequests.get(callId);
+      if (!callRequest) {
+        return;
+      }
+
+      // Clear the timeout
+      clearTimeout(callRequest.timeout);
+      this.callRequests.delete(callId);
+
+      // Notify the caller that the call was rejected
+      const callerSocketId = this.clients.get(callRequest.caller);
+      if (callerSocketId) {
+        this.server.to(callerSocketId).emit('callRejected', {
+          receiver: receiverId,
+          reason,
+        });
+      }
+    } catch (error) {
+      console.error('Error in handleRejectCall:', error);
+    }
+  }
+
+  // Update the answer method to handle call acceptance and recording
+  @SubscribeMessage('answer')
+  async handleAnswer(
+    client: Socket,
+    {
+      callId,
+      caller,
+      appointmentId,
+      answer,
+    }: { callId: string; caller: string; appointmentId: string; answer: any },
+  ) {
+    try {
+      const receiverId = [...this.clients.entries()].find(
+        ([, socketId]) => socketId === client.id,
+      )?.[0];
+
+      if (!receiverId) {
+        client.emit('answerError', {
+          message: 'Authentication required. Please login again.',
+        });
+        return;
+      }
+
+      const callRequest = this.callRequests.get(callId);
+      if (callRequest) {
+        clearTimeout(callRequest.timeout);
+        this.callRequests.delete(callId);
+      }
+
+      const validation = await AppointmentRepository.validateCallAccess(
+        appointmentId,
+        receiverId,
+      );
+
+      if (!validation.success) {
+        client.emit('answerError', {
+          message: validation.message,
+        });
+        return;
+      }
+
+      const callerSocketId = this.clients.get(caller);
+      if (callerSocketId) {
+        // Start recording when call is accepted
+        try {
+          await this.recordingService.startRecording(appointmentId, callId);
+          console.log(`Started recording for call ${callId}`);
+        } catch (error) {
+          console.error('Failed to start recording:', error);
+        }
+
+        this.activeCalls.set(callId, {
+          caller,
+          receiver: receiverId,
+          startTime: new Date(),
+          appointmentId,
+        });
+
+        const durationInMinutes = validation.appointment?.service?.duration
+          ? parseInt(validation.appointment.service.duration)
+          : 60;
+
+        const callTimeout = setTimeout(
+          () => {
+            this.handleCallTimeout(callId);
+          },
+          (durationInMinutes + 5) * 60 * 1000,
+        );
+
+        this.activeCalls.set(callId, {
+          ...this.activeCalls.get(callId),
+          callTimeout,
+        });
+
+        this.server.to(callerSocketId).emit('callAccepted', {
+          callId,
+          answer,
+          receiver: receiverId,
+          appointmentId,
+        });
+
+        console.log(
+          `Call started between ${caller} and ${receiverId} for appointment ${appointmentId}`,
+        );
+      } else {
+        client.emit('answerError', {
+          message: 'Caller is no longer available.',
+        });
+      }
+    } catch (error) {
+      console.error('Error in handleAnswer:', error);
+      client.emit('answerError', {
+        message: 'Failed to answer call. Please try again.',
+      });
+    }
+  }
+
+  // Add method to handle call end and stop recording
+  @SubscribeMessage('endCall')
+  async handleEndCall(
+    client: Socket,
+    { callId, appointmentId }: { callId: string; appointmentId: string },
+  ) {
+    try {
+      const call = this.activeCalls.get(callId);
+      if (!call) return;
+
+      // Stop recording
+      try {
+        // Use the injected recording gateway directly
+        const recordingGateway = this.recordingGateway;
+        await recordingGateway.handleStopRecording(client, { appointmentId });
+
+        // First stop the recording service
+        await this.recordingService.stopRecording(appointmentId);
+        console.log(`Stopped recording for call ${callId}`);
+      } catch (error) {
+        console.error('Failed to stop recording:', error);
+      }
+
+      if (call.callTimeout) {
+        clearTimeout(call.callTimeout);
+      }
+
+      this.activeCalls.delete(callId);
+
+      const callerSocketId = this.clients.get(call.caller);
+      const receiverSocketId = this.clients.get(call.receiver);
+
+      const endMessage = {
+        callId,
+        appointmentId,
+        endedBy: this.socketToUser.get(client.id),
+        message: 'Call ended by participant',
+      };
+
+      if (callerSocketId) {
+        this.server.to(callerSocketId).emit('callEnded', endMessage);
+      }
+
+      if (receiverSocketId) {
+        this.server.to(receiverSocketId).emit('callEnded', endMessage);
+      }
+    } catch (error) {
+      console.error('Error in handleEndCall:', error);
+    }
+  }
+
+  private async handleCallTimeout(callId: string) {
+    try {
+      const call = this.activeCalls.get(callId);
+      if (!call) return;
+
+      // Stop recording on timeout
+      try {
+        await this.recordingService.stopRecording(call.appointmentId);
+        console.log(`Stopped recording for timed out call ${callId}`);
+      } catch (error) {
+        console.error('Failed to stop recording on timeout:', error);
+      }
+
+      if (call.callTimeout) {
+        clearTimeout(call.callTimeout);
+      }
+
+      this.activeCalls.delete(callId);
+
+      const callerSocketId = this.clients.get(call.caller);
+      const receiverSocketId = this.clients.get(call.receiver);
+
+      const timeoutMessage = {
+        callId,
+        appointmentId: call.appointmentId,
+        endedBy: 'system',
+        message: 'Call ended because the appointment time is over.',
+      };
+
+      if (callerSocketId) {
+        this.server.to(callerSocketId).emit('callEnded', timeoutMessage);
+      }
+
+      if (receiverSocketId) {
+        this.server.to(receiverSocketId).emit('callEnded', timeoutMessage);
+      }
+    } catch (error) {
+      console.error('Error in handleCallTimeout:', error);
+    }
+  }
+
+  @SubscribeMessage('reconnectCall')
+  async handleReconnectCall(
+    client: Socket,
+    { callId, appointmentId }: { callId: string; appointmentId: string },
+  ) {
+    try {
+      // Get user ID from the client's socket data
+      const userId = [...this.clients.entries()].find(
+        ([, socketId]) => socketId === client.id,
+      )?.[0];
+
+      if (!userId) {
+        client.emit('reconnectError', {
+          message: 'Authentication required. Please login again.',
+        });
+        return;
+      }
+
+      // Check if the call exists
+      const activeCall = this.activeCalls.get(callId);
+      if (!activeCall) {
+        client.emit('reconnectError', {
+          message: 'Call no longer exists or has ended.',
+        });
+        return;
+      }
+
+      // Check if user is part of the call
+      if (activeCall.caller !== userId && activeCall.receiver !== userId) {
+        client.emit('reconnectError', {
+          message: 'You are not part of this call.',
+        });
+        return;
+      }
+
+      // Determine if user is caller or receiver
+      const isCallerReconnecting = activeCall.caller === userId;
+      const otherPartyId = isCallerReconnecting
+        ? activeCall.receiver
+        : activeCall.caller;
+      const otherPartySocketId = this.clients.get(otherPartyId);
+
+      // Notify the other party about reconnection
+      if (otherPartySocketId) {
+        this.server.to(otherPartySocketId).emit('peerReconnecting', {
+          callId,
+          userId,
+        });
+      }
+
+      // Send reconnection success to the client
+      client.emit('reconnectSuccess', {
+        callId,
+        appointmentId,
+        otherPartyId,
+        role: isCallerReconnecting ? 'caller' : 'receiver',
+      });
+    } catch (error) {
+      console.error('Error in handleReconnectCall:', error);
+      client.emit('reconnectError', {
+        message: 'Failed to reconnect to call. Please try again.',
+      });
+    }
+  }
+
+  @SubscribeMessage('iceCandidate')
+  handleIceCandidate(
+    client: Socket,
+    { callId, candidate, to }: { callId: string; candidate: any; to: string },
+  ) {
+    try {
+      // Get sender ID from the socket-to-user mapping
+      const senderId = this.socketToUser.get(client.id);
+
+      if (!senderId) {
+        console.log(
+          `Could not find user ID for socket ${client.id} when handling ICE candidate`,
+        );
+        return;
+      }
+
+      // Forward the ICE candidate to the other peer
+      const receiverSocketId = this.clients.get(to);
+      if (receiverSocketId) {
+        // console.log(
+        //   `Forwarding ICE candidate from ${senderId} to ${to} (socket: ${receiverSocketId})`,
+        // );
+        this.server.to(receiverSocketId).emit('iceCandidate', {
+          callId,
+          candidate,
+          from: senderId,
+        });
+      } else {
+        console.log(
+          `Could not forward ICE candidate: receiver ${to} not found`,
+        );
+      }
+    } catch (error) {
+      console.error('Error in handleIceCandidate:', error);
+    }
+  }
+
+  private findUserBySocketId(socketId: string): string | undefined {
+    return this.socketToUser.get(socketId);
+  }
+
+  private findSocketIdByUserId(userId: string): string | undefined {
+    return this.clients.get(userId);
+  }
+}

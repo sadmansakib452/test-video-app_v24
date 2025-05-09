@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Phone, Video } from "lucide-react";
 import { useToast } from "@/components/ui/use-toast";
+import { SocketService } from "@/service/socket.service";
 
 type User = {
   id: string;
@@ -22,6 +23,7 @@ type User = {
 export default function UserList() {
   const [users, setUsers] = useState<User[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [onlineUsers, setOnlineUsers] = useState<Record<string, boolean>>({});
   const { user, token, BASE_URL } = useAuth();
   const router = useRouter();
   const { toast } = useToast();
@@ -31,6 +33,20 @@ export default function UserList() {
       fetchUsers();
     }
   }, [token]);
+
+  useEffect(() => {
+    const socketService = SocketService.getInstance();
+    // Listen for userStatusChange events
+    socketService.onUserStatusChange((data) => {
+      setOnlineUsers((prev) => ({
+        ...prev,
+        [data.user_id]: data.status === "online",
+      }));
+    });
+    return () => {
+      socketService.onUserStatusChange(null);
+    };
+  }, []);
 
   const fetchUsers = async () => {
     try {
@@ -168,7 +184,11 @@ export default function UserList() {
                     <AvatarFallback>{getInitials(contact.name)}</AvatarFallback>
                   </Avatar>
                   {/* Online status indicator - this is just visual and would need real-time status in a production app */}
-                  <span className="absolute bottom-0 right-0 w-3 h-3 bg-gray-400 rounded-full border-2 border-white"></span>
+                  <span
+                    className={`absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-white ${
+                      onlineUsers[contact.id] ? "bg-green-500" : "bg-gray-400"
+                    }`}
+                  ></span>
                 </div>
                 <div>
                   <p className="font-medium">{contact.name}</p>
