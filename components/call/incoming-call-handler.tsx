@@ -1,20 +1,29 @@
-"use client"
+"use client";
 
-import { useEffect, useRef, useState } from "react"
-import { useRouter } from "next/navigation"
-import { useAuth } from "@/components/auth/auth-provider"
-import { Button } from "@/components/ui/button"
-import { useToast } from "@/components/ui/use-toast"
-import { Mic, MicOff, Video, VideoOff, Phone, MessageSquare, Settings, Pause } from "lucide-react"
-import io, { type Socket } from "socket.io-client"
+import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useAuth } from "@/components/auth/auth-provider";
+import { Button } from "@/components/ui/button";
+import { useToast } from "@/components/ui/use-toast";
+import {
+  Mic,
+  MicOff,
+  Video,
+  VideoOff,
+  Phone,
+  MessageSquare,
+  Settings,
+  Pause,
+} from "lucide-react";
+import io, { type Socket } from "socket.io-client";
 
 type IncomingCallHandlerProps = {
-  receiverId: string
-  appointmentId: string
-  isVideoCall: boolean
-  callId: string
-  offer: RTCSessionDescriptionInit
-}
+  receiverId: string;
+  appointmentId: string;
+  isVideoCall: boolean;
+  callId: string;
+  offer: RTCSessionDescriptionInit;
+};
 
 export default function IncomingCallHandler({
   receiverId,
@@ -23,178 +32,208 @@ export default function IncomingCallHandler({
   callId,
   offer,
 }: IncomingCallHandlerProps) {
-  const { user, token, BASE_URL } = useAuth()
-  const router = useRouter()
-  const { toast } = useToast()
+  const { user, token, BASE_URL } = useAuth();
+  const router = useRouter();
+  const { toast } = useToast();
 
   // Refs
-  const localVideoRef = useRef<HTMLVideoElement>(null)
-  const remoteVideoRef = useRef<HTMLVideoElement>(null)
-  const socketRef = useRef<Socket | null>(null)
-  const peerConnectionRef = useRef<RTCPeerConnection | null>(null)
-  const localStreamRef = useRef<MediaStream | null>(null)
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const socketRef = useRef<Socket | null>(null);
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
 
   // State
-  const [callStatus, setCallStatus] = useState<"connecting" | "connected" | "ended">("connecting")
-  const [isMuted, setIsMuted] = useState(false)
-  const [isVideoOff, setIsVideoOff] = useState(false)
-  const [isRecording, setIsRecording] = useState(false)
-  const [isOnHold, setIsOnHold] = useState(false)
-  const [isChatOpen, setIsChatOpen] = useState(false)
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false)
-  const [remoteDescSet, setRemoteDescSet] = useState(false)
-  const [candidateQueue, setCandidateQueue] = useState<RTCIceCandidate[]>([])
+  const [callStatus, setCallStatus] = useState<
+    "connecting" | "connected" | "ended"
+  >("connecting");
+  const [isMuted, setIsMuted] = useState(false);
+  const [isVideoOff, setIsVideoOff] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingError, setRecordingError] = useState<string | null>(null);
+  const [recordingSize, setRecordingSize] = useState(0);
+  const [isOnHold, setIsOnHold] = useState(false);
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [remoteDescSet, setRemoteDescSet] = useState(false);
+  const [candidateQueue, setCandidateQueue] = useState<RTCIceCandidate[]>([]);
+  const MAX_RECORDING_SIZE = 100 * 1024 * 1024; // 100MB
 
   // Initialize WebRTC
   useEffect(() => {
-    let mounted = true
+    let mounted = true;
 
     const initialize = async () => {
       try {
         // Connect socket
-        socketRef.current = io(BASE_URL, { auth: { token } })
+        socketRef.current = io(BASE_URL, { auth: { token } });
 
         // Set up socket event handlers
-        setupSocketHandlers()
+        setupSocketHandlers();
 
         // Set up media
-        await setupMedia()
+        await setupMedia();
 
         // Create peer connection
-        createPeerConnection()
+        createPeerConnection();
 
         // Handle the incoming call
-        await handleIncomingCall()
+        await handleIncomingCall();
       } catch (error) {
-        console.error("Error initializing call:", error)
+        console.error("Error initializing call:", error);
         toast({
           title: "Call Error",
           description: "Failed to initialize call",
           variant: "destructive",
-        })
-        endCall()
+        });
+        endCall();
       }
-    }
+    };
 
-    initialize()
+    initialize();
 
     return () => {
-      mounted = false
-      cleanupCall()
-    }
-  }, [])
+      mounted = false;
+      cleanupCall();
+    };
+  }, []);
 
   const setupSocketHandlers = () => {
-    if (!socketRef.current) return
+    if (!socketRef.current) return;
 
     socketRef.current.on("connect", () => {
-      console.log("Socket connected:", socketRef.current?.id)
-    })
+      console.log("Socket connected:", socketRef.current?.id);
+    });
 
     socketRef.current.on("connect_error", (error) => {
-      console.error("Socket connection error:", error)
+      console.error("Socket connection error:", error);
       toast({
         title: "Connection Error",
         description: "Failed to connect to the signaling server",
         variant: "destructive",
-      })
-      endCall()
-    })
+      });
+      endCall();
+    });
 
     socketRef.current.on("disconnect", (reason) => {
-      console.log("Socket disconnected:", reason)
+      console.log("Socket disconnected:", reason);
       if (callStatus === "connected") {
         toast({
           title: "Connection Lost",
           description: "Your connection to the server was lost",
           variant: "destructive",
-        })
-        endCall()
+        });
+        endCall();
       }
-    })
+    });
 
     socketRef.current.on("callEnded", (data) => {
-      console.log("Call ended:", data)
+      console.log("Call ended:", data);
       toast({
         title: "Call Ended",
         description: data.message || "The call has ended",
-      })
-      endCall()
-    })
+      });
+      endCall();
+    });
 
     socketRef.current.on("answerError", (data) => {
-      console.error("Answer error:", data)
+      console.error("Answer error:", data);
       toast({
         title: "Call Error",
         description: data.message || "Failed to answer call",
         variant: "destructive",
-      })
-      endCall()
-    })
+      });
+      endCall();
+    });
 
     socketRef.current.on("iceCandidate", async (data) => {
       try {
-        console.log("Received ICE candidate")
+        console.log("Received ICE candidate");
         if (!remoteDescSet) {
-          setCandidateQueue((prev) => [...prev, data.candidate])
+          setCandidateQueue((prev) => [...prev, data.candidate]);
         } else if (peerConnectionRef.current) {
-          await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(data.candidate))
+          await peerConnectionRef.current.addIceCandidate(
+            new RTCIceCandidate(data.candidate)
+          );
         }
       } catch (error) {
-        console.error("Error handling ICE candidate:", error)
+        console.error("Error handling ICE candidate:", error);
       }
-    })
+    });
 
     socketRef.current.on("recordingStarted", () => {
-      console.log("Recording started")
-      setIsRecording(true)
+      console.log("Recording started");
+      setIsRecording(true);
+      setRecordingError(null);
       toast({
         title: "Recording Started",
         description: "Call recording has started",
-      })
-    })
+      });
+    });
 
     socketRef.current.on("recordingStopped", () => {
-      console.log("Recording stopped")
-      setIsRecording(false)
+      console.log("Recording stopped");
+      setIsRecording(false);
+      setRecordingError(null);
       toast({
         title: "Recording Stopped",
         description: "Call recording has stopped",
-      })
-    })
-  }
+      });
+    });
+
+    socketRef.current.on("recordingError", (error) => {
+      console.error("Recording error:", error);
+      setRecordingError(error.message);
+      setIsRecording(false);
+      toast({
+        title: "Recording Error",
+        description: error.message || "An error occurred while recording",
+        variant: "destructive",
+      });
+    });
+
+    socketRef.current.on("chunkReceived", (data) => {
+      console.log("Recording chunk received:", data);
+      // Update recording size if provided
+      if (data.size) {
+        setRecordingSize((prev) => prev + data.size);
+      }
+    });
+  };
 
   const setupMedia = async () => {
     try {
-      const constraints = isVideoCall ? { video: true, audio: true } : { audio: true }
+      const constraints = isVideoCall
+        ? { video: true, audio: true }
+        : { audio: true };
 
-      const stream = await navigator.mediaDevices.getUserMedia(constraints)
-      localStreamRef.current = stream
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      localStreamRef.current = stream;
 
       if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream
+        localVideoRef.current.srcObject = stream;
       }
 
-      return stream
+      return stream;
     } catch (error) {
-      console.error("Error accessing media devices:", error)
-      throw error
+      console.error("Error accessing media devices:", error);
+      throw error;
     }
-  }
+  };
 
   const createPeerConnection = () => {
     try {
       const pc = new RTCPeerConnection({
         iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-      })
+      });
 
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach((track) => {
           if (localStreamRef.current) {
-            pc.addTrack(track, localStreamRef.current)
+            pc.addTrack(track, localStreamRef.current);
           }
-        })
+        });
       }
 
       pc.onicecandidate = (event) => {
@@ -203,50 +242,62 @@ export default function IncomingCallHandler({
             callId,
             candidate: event.candidate,
             to: receiverId,
-          })
+          });
         }
-      }
+      };
 
       pc.ontrack = (event) => {
         if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = event.streams[0]
+          remoteVideoRef.current.srcObject = event.streams[0];
+          remoteVideoRef.current.muted = false;
+          remoteVideoRef.current.volume = 1.0;
+
+          event.streams[0].getAudioTracks().forEach((track) => {
+            track.enabled = true;
+          });
         }
-      }
+      };
 
       pc.oniceconnectionstatechange = () => {
-        console.log("ICE connection state:", pc.iceConnectionState)
+        console.log("ICE connection state:", pc.iceConnectionState);
 
-        if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
+        if (
+          pc.iceConnectionState === "failed" ||
+          pc.iceConnectionState === "disconnected"
+        ) {
           toast({
             title: "Connection Failed",
-            description: "Failed to establish a direct connection with the recipient",
+            description:
+              "Failed to establish a direct connection with the recipient",
             variant: "destructive",
-          })
+          });
 
           if (callStatus === "connecting") {
-            endCall()
+            endCall();
           }
         }
-      }
+      };
 
-      peerConnectionRef.current = pc
+      peerConnectionRef.current = pc;
     } catch (error) {
-      console.error("Error creating peer connection:", error)
-      throw error
+      console.error("Error creating peer connection:", error);
+      throw error;
     }
-  }
+  };
 
   const handleIncomingCall = async () => {
     try {
-      if (!peerConnectionRef.current || !socketRef.current) return
+      if (!peerConnectionRef.current || !socketRef.current) return;
 
       // Set the remote description from the offer
-      await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(offer))
-      setRemoteDescSet(true)
+      await peerConnectionRef.current.setRemoteDescription(
+        new RTCSessionDescription(offer)
+      );
+      setRemoteDescSet(true);
 
       // Create an answer
-      const answer = await peerConnectionRef.current.createAnswer()
-      await peerConnectionRef.current.setLocalDescription(answer)
+      const answer = await peerConnectionRef.current.createAnswer();
+      await peerConnectionRef.current.setLocalDescription(answer);
 
       // Send the answer to the caller
       socketRef.current.emit("answer", {
@@ -254,148 +305,179 @@ export default function IncomingCallHandler({
         caller: receiverId,
         appointmentId,
         answer,
-      })
+      });
 
       // Flush any queued ICE candidates
-      flushCandidates()
+      flushCandidates();
 
       // Update call status
-      setCallStatus("connected")
+      setCallStatus("connected");
 
-      console.log("Call answered successfully")
+      console.log("Call answered successfully");
     } catch (error) {
-      console.error("Error handling incoming call:", error)
+      console.error("Error handling incoming call:", error);
       toast({
         title: "Call Error",
         description: "Failed to answer call",
         variant: "destructive",
-      })
-      endCall()
+      });
+      endCall();
     }
-  }
+  };
 
   const flushCandidates = async () => {
-    if (!peerConnectionRef.current) return
+    if (!peerConnectionRef.current) return;
 
     for (const candidate of candidateQueue) {
-      await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate))
+      await peerConnectionRef.current.addIceCandidate(
+        new RTCIceCandidate(candidate)
+      );
     }
 
-    setCandidateQueue([])
-  }
+    setCandidateQueue([]);
+  };
 
   const toggleMute = () => {
-    if (!localStreamRef.current) return
+    if (!localStreamRef.current) return;
 
-    const audioTracks = localStreamRef.current.getAudioTracks()
+    const audioTracks = localStreamRef.current.getAudioTracks();
     audioTracks.forEach((track) => {
-      track.enabled = isMuted
-    })
+      track.enabled = isMuted;
+    });
 
-    setIsMuted(!isMuted)
-  }
+    setIsMuted(!isMuted);
+  };
 
   const toggleVideo = () => {
-    if (!localStreamRef.current) return
+    if (!localStreamRef.current) return;
 
-    const videoTracks = localStreamRef.current.getVideoTracks()
+    const videoTracks = localStreamRef.current.getVideoTracks();
     videoTracks.forEach((track) => {
-      track.enabled = isVideoOff
-    })
+      track.enabled = isVideoOff;
+    });
 
-    setIsVideoOff(!isVideoOff)
-  }
+    setIsVideoOff(!isVideoOff);
+  };
 
   const toggleHold = () => {
-    setIsOnHold(!isOnHold)
+    setIsOnHold(!isOnHold);
 
-    if (!localStreamRef.current) return
+    if (!localStreamRef.current) return;
 
-    const tracks = localStreamRef.current.getTracks()
+    const tracks = localStreamRef.current.getTracks();
     tracks.forEach((track) => {
-      track.enabled = isOnHold
-    })
-  }
+      track.enabled = isOnHold;
+    });
+  };
 
   const toggleRecording = async () => {
     if (isRecording) {
-      stopRecording()
+      stopRecording();
     } else {
-      startRecording()
+      startRecording();
     }
-  }
+  };
 
   const startRecording = async () => {
-    if (!socketRef.current) return
+    if (!socketRef.current) return;
 
-    // In this implementation, we'll use the server's recording functionality
-    socketRef.current.emit("startRecording", {
-      appointmentId,
-    })
+    try {
+      // Check if we're approaching the size limit
+      if (recordingSize >= MAX_RECORDING_SIZE) {
+        setRecordingError("Recording size limit reached");
+        toast({
+          title: "Recording Error",
+          description: "Maximum recording size reached",
+          variant: "destructive",
+        });
+        return;
+      }
 
-    toast({
-      title: "Starting Recording",
-      description: "Requesting to start call recording...",
-    })
-  }
+      socketRef.current.emit("startRecording", {
+        appointmentId,
+      });
+
+      toast({
+        title: "Starting Recording",
+        description: "Requesting to start call recording...",
+      });
+    } catch (error) {
+      console.error("Error starting recording:", error);
+      setRecordingError("Failed to start recording");
+      toast({
+        title: "Recording Error",
+        description: "Failed to start recording",
+        variant: "destructive",
+      });
+    }
+  };
 
   const stopRecording = () => {
-    if (!socketRef.current) return
+    if (!socketRef.current) return;
 
-    // Use the server's recording functionality
-    socketRef.current.emit("stopRecording", {
-      appointmentId,
-    })
+    try {
+      socketRef.current.emit("stopRecording", {
+        appointmentId,
+      });
 
-    toast({
-      title: "Stopping Recording",
-      description: "Requesting to stop call recording...",
-    })
-  }
+      toast({
+        title: "Stopping Recording",
+        description: "Requesting to stop call recording...",
+      });
+    } catch (error) {
+      console.error("Error stopping recording:", error);
+      setRecordingError("Failed to stop recording");
+      toast({
+        title: "Recording Error",
+        description: "Failed to stop recording",
+        variant: "destructive",
+      });
+    }
+  };
 
   const endCall = () => {
     if (socketRef.current) {
       socketRef.current.emit("endCall", {
         callId,
         appointmentId,
-      })
+      });
     }
 
-    cleanupCall()
-    router.push("/dashboard")
-  }
+    cleanupCall();
+    router.push("/dashboard");
+  };
 
   const cleanupCall = () => {
     // Stop recording if active
     if (isRecording && socketRef.current) {
       socketRef.current.emit("stopRecording", {
         appointmentId,
-      })
+      });
     }
 
     // Close peer connection
     if (peerConnectionRef.current) {
-      peerConnectionRef.current.close()
-      peerConnectionRef.current = null
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
     }
 
     // Stop all tracks
     if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => track.stop())
-      localStreamRef.current = null
+      localStreamRef.current.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
     }
 
     // Disconnect socket
     if (socketRef.current) {
-      socketRef.current.disconnect()
-      socketRef.current = null
+      socketRef.current.disconnect();
+      socketRef.current = null;
     }
 
     // Reset state
-    setRemoteDescSet(false)
-    setCandidateQueue([])
-    setCallStatus("ended")
-  }
+    setRemoteDescSet(false);
+    setCandidateQueue([]);
+    setCallStatus("ended");
+  };
 
   return (
     <div className="relative w-full h-screen bg-gray-900 overflow-hidden">
@@ -446,7 +528,11 @@ export default function IncomingCallHandler({
             onClick={toggleRecording}
             disabled={user?.type !== "coach" || callStatus !== "connected"}
           >
-            <div className={`w-3 h-3 rounded-full ${isRecording ? "bg-red-500 animate-pulse" : "bg-gray-400"}`}></div>
+            <div
+              className={`w-3 h-3 rounded-full ${
+                isRecording ? "bg-red-500 animate-pulse" : "bg-gray-400"
+              }`}
+            ></div>
             <span className="text-xs">Record</span>
           </Button>
 
@@ -466,24 +552,41 @@ export default function IncomingCallHandler({
           <Button
             variant="secondary"
             size="icon"
-            className={`rounded-full bg-gray-200 hover:bg-gray-300 ${isMuted ? "bg-red-100 hover:bg-red-200 text-red-500" : ""}`}
+            className={`rounded-full bg-gray-200 hover:bg-gray-300 ${
+              isMuted ? "bg-red-100 hover:bg-red-200 text-red-500" : ""
+            }`}
             onClick={toggleMute}
             disabled={callStatus !== "connected"}
           >
-            {isMuted ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
+            {isMuted ? (
+              <MicOff className="h-5 w-5" />
+            ) : (
+              <Mic className="h-5 w-5" />
+            )}
           </Button>
 
           <Button
             variant="secondary"
             size="icon"
-            className={`rounded-full bg-gray-200 hover:bg-gray-300 ${isVideoOff ? "bg-red-100 hover:bg-red-200 text-red-500" : ""}`}
+            className={`rounded-full bg-gray-200 hover:bg-gray-300 ${
+              isVideoOff ? "bg-red-100 hover:bg-red-200 text-red-500" : ""
+            }`}
             onClick={toggleVideo}
             disabled={!isVideoCall || callStatus !== "connected"}
           >
-            {isVideoOff ? <VideoOff className="h-5 w-5" /> : <Video className="h-5 w-5" />}
+            {isVideoOff ? (
+              <VideoOff className="h-5 w-5" />
+            ) : (
+              <Video className="h-5 w-5" />
+            )}
           </Button>
 
-          <Button variant="destructive" size="icon" className="rounded-full" onClick={endCall}>
+          <Button
+            variant="destructive"
+            size="icon"
+            className="rounded-full"
+            onClick={endCall}
+          >
             <Phone className="h-5 w-5 rotate-135" />
           </Button>
         </div>
@@ -550,7 +653,9 @@ export default function IncomingCallHandler({
               </select>
             </div>
             <div>
-              <label className="block text-sm font-medium mb-1">Microphone</label>
+              <label className="block text-sm font-medium mb-1">
+                Microphone
+              </label>
               <select className="w-full border rounded-md px-2 py-1 text-sm">
                 <option>Default Microphone</option>
                 <option>Headset Microphone</option>
@@ -564,7 +669,9 @@ export default function IncomingCallHandler({
               </select>
             </div>
             <div>
-              <label className="block text-sm font-medium mb-1">Video Quality</label>
+              <label className="block text-sm font-medium mb-1">
+                Video Quality
+              </label>
               <select className="w-full border rounded-md px-2 py-1 text-sm">
                 <option>High (720p)</option>
                 <option>Standard (480p)</option>
@@ -572,6 +679,20 @@ export default function IncomingCallHandler({
               </select>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Recording error display */}
+      {recordingError && (
+        <div className="absolute top-4 left-1/2 transform -translate-x-1/2 bg-red-500 text-white px-4 py-2 rounded-md shadow-lg">
+          {recordingError}
+        </div>
+      )}
+
+      {/* Recording size indicator */}
+      {isRecording && (
+        <div className="absolute top-4 left-1/2 transform -translate-x-1/2 bg-gray-800 text-white px-4 py-2 rounded-md shadow-lg">
+          Recording: {Math.round(recordingSize / (1024 * 1024))}MB
         </div>
       )}
 
@@ -588,5 +709,5 @@ export default function IncomingCallHandler({
         </div>
       )}
     </div>
-  )
+  );
 }

@@ -1,89 +1,101 @@
-"use client"
+"use client";
 
-import type React from "react"
-import { createContext, useContext, useState, useRef, useEffect, type ReactNode } from "react"
-import { useRouter } from "next/navigation"
-import { useAuth } from "@/components/auth/auth-provider"
-import { useToast } from "@/components/ui/use-toast"
-import { SocketService } from "@/service/socket.service"
+import type React from "react";
+import {
+  createContext,
+  useContext,
+  useState,
+  useRef,
+  useEffect,
+  type ReactNode,
+} from "react";
+import { useRouter } from "next/navigation";
+import { useAuth } from "@/components/auth/auth-provider";
+import { useToast } from "@/components/ui/use-toast";
+import { SocketService } from "@/service/socket.service";
 
 type CallUser = {
-  img: string
-  name: string
-  title?: string
-}
+  img: string;
+  name: string;
+  title?: string;
+};
 
 interface Message {
-  id: number
-  text: string
-  sender: string
-  timestamp: Date
-  isAudio?: boolean
-  isVideo?: boolean
-  audioDuration?: string
-  audioUrl?: string
-  videoUrl?: string
-  imageUrl?: string
+  id: number;
+  text: string;
+  sender: string;
+  timestamp: Date;
+  isAudio?: boolean;
+  isVideo?: boolean;
+  audioDuration?: string;
+  audioUrl?: string;
+  videoUrl?: string;
+  imageUrl?: string;
 }
 
 interface CallContextType {
   // Call state
-  callStatus: "connecting" | "connected" | "ended"
-  isMuted: boolean
-  isHolding: boolean
-  isRecording: boolean
-  isChatOpen: boolean
-  isSettingsOpen: boolean
-  callTimeoutSeconds: number
-  callTime: number
-  callUser: CallUser | null
-  callType: "audio" | "video"
+  callStatus: "connecting" | "connected" | "ended";
+  isMuted: boolean;
+  isHolding: boolean;
+  isRecording: boolean;
+  isChatOpen: boolean;
+  isSettingsOpen: boolean;
+  callTimeoutSeconds: number;
+  callTime: number;
+  callUser: CallUser | null;
+  callType: "audio" | "video";
 
   // Media refs
-  localVideoRef: React.RefObject<HTMLVideoElement>
-  remoteVideoRef: React.RefObject<HTMLVideoElement>
+  localVideoRef: React.RefObject<HTMLVideoElement | null>;
+  remoteVideoRef: React.RefObject<HTMLVideoElement | null>;
 
   // Messages
-  messages: Message[]
+  messages: Message[];
 
   // Actions
-  toggleMute: () => void
-  toggleHold: () => void
-  toggleRecording: () => void
-  toggleChat: () => void
-  toggleSettings: () => void
-  endCall: () => void
-  sendChatMessage: (audioUrl: string | null, message: string, imageUrl?: string, videoUrl?: string) => void
+  toggleMute: () => void;
+  toggleHold: () => void;
+  toggleRecording: () => void;
+  toggleChat: () => void;
+  toggleSettings: () => void;
+  endCall: () => void;
+  sendChatMessage: (
+    audioUrl: string | null,
+    message: string,
+    imageUrl?: string,
+    videoUrl?: string
+  ) => void;
 
   // Call info
-  receiverId: string
-  appointmentId: string
-  isVideoCall: boolean
-  isIncoming: boolean
-  setIsChatOpen: (isOpen: boolean) => void
-  setIsSettingsOpen: (isOpen: boolean) => void
+  receiverId: string;
+  appointmentId: string;
+  isVideoCall: boolean;
+  isIncoming: boolean;
+  setIsChatOpen: (isOpen: boolean) => void;
+  setIsSettingsOpen: (isOpen: boolean) => void;
 }
 
-const CallContext = createContext<CallContextType | undefined>(undefined)
+const CallContext = createContext<CallContextType | undefined>(undefined);
 
 export function useCall() {
-  const context = useContext(CallContext)
+  const context = useContext(CallContext);
   if (context === undefined) {
-    throw new Error("useCall must be used within a CallProvider")
+    throw new Error("useCall must be used within a CallProvider");
   }
-  return context
+  return context;
 }
 
 type CallProviderProps = {
-  children: ReactNode
-  receiverId: string
-  appointmentId: string
-  isVideoCall: boolean
-  isIncoming: boolean
-  callId: string | null
-  offer: RTCSessionDescriptionInit | null
-  initialUser?: CallUser
-}
+  children: ReactNode;
+  receiverId: string;
+  appointmentId: string;
+  isVideoCall: boolean;
+  isIncoming: boolean;
+  callId: string | null;
+  offer: RTCSessionDescriptionInit | null;
+  initialUser?: CallUser;
+};
 
 export function CallProvider({
   children,
@@ -95,25 +107,31 @@ export function CallProvider({
   offer,
   initialUser,
 }: CallProviderProps) {
-  const router = useRouter()
-  const { user, token, BASE_URL } = useAuth()
-  const { toast } = useToast()
+  const router = useRouter();
+  const { user, token, BASE_URL } = useAuth();
+  const { toast } = useToast();
 
   // Refs
-  const localVideoRef = useRef<HTMLVideoElement>(null)
-  const remoteVideoRef = useRef<HTMLVideoElement>(null)
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
 
   // State
-  const [callStatus, setCallStatus] = useState<"connecting" | "connected" | "ended">("connecting")
-  const [isMuted, setIsMuted] = useState(false)
-  const [isHolding, setIsHolding] = useState(false)
-  const [isRecording, setIsRecording] = useState(false)
-  const [isChatOpen, setIsChatOpen] = useState(false)
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false)
-  const [callTimeoutSeconds, setCallTimeoutSeconds] = useState(30)
-  const [callTime, setCallTime] = useState(0)
-  const [callUser, setCallUser] = useState<CallUser | null>(initialUser || null)
-  const [callType, setCallType] = useState<"audio" | "video">(isVideoCall ? "video" : "audio")
+  const [callStatus, setCallStatus] = useState<
+    "connecting" | "connected" | "ended"
+  >("connecting");
+  const [isMuted, setIsMuted] = useState(false);
+  const [isHolding, setIsHolding] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [callTimeoutSeconds, setCallTimeoutSeconds] = useState(30);
+  const [callTime, setCallTime] = useState(0);
+  const [callUser, setCallUser] = useState<CallUser | null>(
+    initialUser || null
+  );
+  const [callType, setCallType] = useState<"audio" | "video">(
+    isVideoCall ? "video" : "audio"
+  );
 
   // Messages
   const [messages, setMessages] = useState<Message[]>([
@@ -149,91 +167,99 @@ export function CallProvider({
       sender: "me",
       timestamp: new Date(),
     },
-  ])
+  ]);
 
   // Initialize socket service
-  const socketService = SocketService.getInstance()
+  const socketService = SocketService.getInstance();
 
   // Timer for call duration
   useEffect(() => {
     if (callStatus === "connected") {
       const timer = setInterval(() => {
-        setCallTime((prevTime) => prevTime + 1)
-      }, 1000)
+        setCallTime((prevTime) => prevTime + 1);
+      }, 1000);
 
-      return () => clearInterval(timer)
+      return () => clearInterval(timer);
     }
-  }, [callStatus])
+  }, [callStatus]);
 
   // Initialize call
   useEffect(() => {
     const initializeCall = async () => {
       try {
         // Connect to socket
-        await socketService.connect(token!, BASE_URL)
+        await socketService.connect(token!, BASE_URL);
 
         // Set up event handlers
         const setupEventHandlers = () => {
           socketService.onCallAccepted(() => {
-            setCallStatus("connected")
-          })
+            setCallStatus("connected");
+          });
 
           socketService.onCallEnded(() => {
-            endCall()
-          })
+            endCall();
+          });
 
           socketService.onChatMessage((message: Message) => {
-            setMessages((prev) => [...prev, message])
-          })
+            setMessages((prev) => [...prev, message]);
+          });
 
           socketService.onCallTimeout = function (callback) {
-            this.onCallTimeoutCallback = callback
-          }
+            this.onCallTimeoutCallback = callback;
+          };
 
           socketService.onCallTimeout(() => {
             toast({
               title: "Call Timed Out",
               description: "The call has timed out due to no response.",
               variant: "destructive",
-            })
-            endCall()
-          })
-        }
+            });
+            endCall();
+          });
+        };
 
         // Set up event handlers
-        setupEventHandlers()
+        setupEventHandlers();
 
         // Set up media
-        await setupMedia()
+        await setupMedia();
 
         // Handle call based on whether it's incoming or outgoing
         if (!isIncoming) {
           // Join the call room first
-          socketService.joinCall(appointmentId)
+          socketService.joinCall(appointmentId);
 
           // After joining, initiate the call
           socketService.onJoinedCall(async () => {
             try {
               // Initiate the call to the receiver
-              await socketService.initiateCall(appointmentId, receiverId, isVideoCall)
-              console.log(`Initiating ${isVideoCall ? "video" : "audio"} call to ${receiverId}`)
+              await socketService.initiateCall(
+                appointmentId,
+                receiverId,
+                isVideoCall
+              );
+              console.log(
+                `Initiating ${
+                  isVideoCall ? "video" : "audio"
+                } call to ${receiverId}`
+              );
 
               // Start countdown timer
-              startCountdownTimer()
+              startCountdownTimer();
             } catch (error) {
-              console.error("Error initiating call:", error)
+              console.error("Error initiating call:", error);
               toast({
                 title: "Call Error",
                 description: "Failed to initiate call",
                 variant: "destructive",
-              })
-              endCall()
+              });
+              endCall();
             }
-          })
+          });
         } else {
           // For incoming calls, handle the incoming call with the offer
           if (callId && offer) {
-            await handleIncomingCall(callId, offer)
+            await handleIncomingCall(callId, offer);
           }
         }
 
@@ -241,111 +267,119 @@ export function CallProvider({
         // socketService.joinCall(appointmentId)
         // startCountdownTimer()
       } catch (error) {
-        console.error("Error initializing call:", error)
+        console.error("Error initializing call:", error);
         toast({
           title: "Call Error",
           description: "Failed to initialize call",
           variant: "destructive",
-        })
-        endCall()
+        });
+        endCall();
       }
-    }
+    };
 
-    initializeCall()
+    initializeCall();
 
     return () => {
-      cleanupCall()
-    }
-  }, [])
+      cleanupCall();
+    };
+  }, []);
 
   // Add this function to ensure audio is unmuted initially
   const setupMedia = async () => {
     try {
-      const stream = await socketService.setupLocalMedia(isVideoCall)
+      const stream = await socketService.setupLocalMedia(isVideoCall);
 
       if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream
+        localVideoRef.current.srcObject = stream;
       }
 
       // Make sure audio is enabled by default
       stream.getAudioTracks().forEach((track) => {
-        track.enabled = true
-      })
+        track.enabled = true;
+      });
 
       // Set up remote video
       socketService.onRemoteStream((stream) => {
         if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = stream
+          remoteVideoRef.current.srcObject = stream;
           // Ensure the remote video element has audio enabled
-          remoteVideoRef.current.muted = false
-          remoteVideoRef.current.volume = 1.0
+          remoteVideoRef.current.muted = false;
+          remoteVideoRef.current.volume = 1.0;
         }
-      })
+      });
 
-      return stream
+      return stream;
     } catch (error) {
-      console.error("Error accessing media devices:", error)
-      throw error
+      console.error("Error accessing media devices:", error);
+      throw error;
     }
-  }
+  };
 
-  const handleIncomingCall = async (callId: string, offer: RTCSessionDescriptionInit) => {
+  const handleIncomingCall = async (
+    callId: string,
+    offer: RTCSessionDescriptionInit
+  ) => {
     try {
-      await socketService.answerCall(callId, receiverId, appointmentId, offer)
-      setCallStatus("connected")
+      await socketService.answerCall(callId, receiverId, appointmentId, offer);
+      setCallStatus("connected");
     } catch (error) {
-      console.error("Error handling incoming call:", error)
+      console.error("Error handling incoming call:", error);
       toast({
         title: "Call Error",
         description: "Failed to answer call",
         variant: "destructive",
-      })
-      endCall()
+      });
+      endCall();
     }
-  }
+  };
 
   const startCountdownTimer = () => {
-    setCallTimeoutSeconds(30)
+    setCallTimeoutSeconds(30);
     const countdownInterval = setInterval(() => {
       setCallTimeoutSeconds((prev) => {
         if (prev <= 1) {
-          clearInterval(countdownInterval)
-          return 0
+          clearInterval(countdownInterval);
+          return 0;
         }
-        return prev - 1
-      })
-    }, 1000)
+        return prev - 1;
+      });
+    }, 1000);
 
-    socketService.setCallTimeout(countdownInterval)
-  }
+    socketService.setCallTimeout(countdownInterval);
+  };
 
   const toggleMute = () => {
-    socketService.toggleAudio()
-    setIsMuted(!isMuted)
-  }
+    socketService.toggleAudio();
+    setIsMuted(!isMuted);
+  };
 
   const toggleHold = () => {
-    socketService.toggleHold()
-    setIsHolding(!isHolding)
-  }
+    socketService.toggleHold();
+    setIsHolding(!isHolding);
+  };
 
   const toggleRecording = () => {
     if (isRecording) {
-      socketService.stopRecording(appointmentId)
+      socketService.stopRecording(appointmentId);
     } else {
-      socketService.startRecording(appointmentId)
+      socketService.startRecording(appointmentId);
     }
-  }
+  };
 
   const toggleChat = () => {
-    setIsChatOpen(!isChatOpen)
-  }
+    setIsChatOpen(!isChatOpen);
+  };
 
   const toggleSettings = () => {
-    setIsSettingsOpen(!isSettingsOpen)
-  }
+    setIsSettingsOpen(!isSettingsOpen);
+  };
 
-  const sendChatMessage = (audioUrl: string | null, message: string, imageUrl?: string, videoUrl?: string) => {
+  const sendChatMessage = (
+    audioUrl: string | null,
+    message: string,
+    imageUrl?: string,
+    videoUrl?: string
+  ) => {
     // Create local message
     const newMessage: Message = {
       id: Date.now(),
@@ -358,32 +392,67 @@ export function CallProvider({
       audioUrl: audioUrl || undefined,
       videoUrl: videoUrl,
       imageUrl: imageUrl,
-    }
+    };
 
-    setMessages((prev) => [...prev, newMessage])
+    setMessages((prev) => [...prev, newMessage]);
 
     // Send to server
-    socketService.sendChatMessage(appointmentId, message, audioUrl || undefined, imageUrl, videoUrl)
-  }
+    socketService.sendChatMessage(
+      appointmentId,
+      message,
+      audioUrl || undefined,
+      imageUrl,
+      videoUrl
+    );
+  };
 
   const endCall = () => {
-    socketService.endCall(appointmentId)
-    cleanupCall()
-    router.push("/dashboard")
-  }
+    socketService.endCall(appointmentId);
+    cleanupCall();
+    router.push("/dashboard");
+  };
 
   const cleanupCall = () => {
     // Stop recording if active
     if (isRecording) {
-      socketService.stopRecording(appointmentId)
+      socketService.stopRecording(appointmentId);
     }
 
     // Clean up socket and media
-    socketService.cleanup()
+    socketService.cleanup();
 
     // Reset state
-    setCallStatus("ended")
-  }
+    setCallStatus("ended");
+  };
+
+  // Recording event handlers
+  useEffect(() => {
+    if (!socketService) return;
+
+    socketService.onRecordingStarted(() => {
+      console.log("Recording started");
+      setIsRecording(true);
+    });
+
+    socketService.onRecordingStopped(() => {
+      console.log("Recording stopped");
+      setIsRecording(false);
+    });
+
+    socketService.onCallError((error) => {
+      console.error("Recording error:", error);
+      toast({
+        title: "Recording Error",
+        description: error.message || "An error occurred with the recording",
+        variant: "destructive",
+      });
+      setIsRecording(false);
+    });
+
+    return () => {
+      // Cleanup will be handled by socketService.cleanup()
+    };
+  }, [socketService]);
 
   const value = {
     callStatus,
@@ -412,7 +481,7 @@ export function CallProvider({
     isIncoming,
     setIsChatOpen,
     setIsSettingsOpen,
-  }
+  };
 
-  return <CallContext.Provider value={value}>{children}</CallContext.Provider>
+  return <CallContext.Provider value={value}>{children}</CallContext.Provider>;
 }

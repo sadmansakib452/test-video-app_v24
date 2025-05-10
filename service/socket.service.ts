@@ -11,6 +11,11 @@ export class SocketService {
   private callTimeout: NodeJS.Timeout | null = null;
   private candidateQueue: RTCIceCandidate[] = [];
   private remoteDescSet = false;
+  private mediaRecorder: MediaRecorder | null = null;
+  private recordingChunks: Blob[] = [];
+  private readonly MAX_CHUNK_SIZE = 1024 * 1024; // 1MB
+  private readonly MAX_RECORDING_SIZE = 100 * 1024 * 1024; // 100MB
+  private currentRecordingSize = 0;
 
   // Event callbacks
   private onConnectCallback: (() => void) | null = null;
@@ -219,6 +224,18 @@ export class SocketService {
     this.socket.on("chatMessage", (data) => {
       console.log("Chat message received:", data);
       if (this.onChatMessageCallback) this.onChatMessageCallback(data);
+    });
+
+    // Add new recording event handlers
+    this.socket.on("chunkReceived", (data) => {
+      console.log("Recording chunk received by server:", data);
+    });
+
+    this.socket.on("recordingError", (error) => {
+      console.error("Recording error:", error);
+      if (this.onCallErrorCallback) {
+        this.onCallErrorCallback(error);
+      }
     });
   }
 
@@ -472,13 +489,89 @@ export class SocketService {
 
   // Recording methods
   public startRecording(appointmentId: string): void {
-    if (!this.socket) return;
-    this.socket.emit("startRecording", { appointmentId });
+    if (!this.socket || !this.localStream) return;
+
+    try {
+      // Initialize MediaRecorder with appropriate settings
+      this.mediaRecorder = new MediaRecorder(this.localStream, {
+        mimeType: "video/webm",
+        videoBitsPerSecond: 2500000, // 2.5 Mbps
+      });
+
+      this.recordingChunks = [];
+      this.currentRecordingSize = 0;
+
+      // Handle data available event
+      this.mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          // Check size limits
+          if (
+            this.currentRecordingSize + event.data.size >
+            this.MAX_RECORDING_SIZE
+          ) {
+            this.stopRecording(appointmentId);
+            if (this.onCallErrorCallback) {
+              this.onCallErrorCallback({
+                message: "Recording size limit exceeded",
+              });
+            }
+            return;
+          }
+
+          // Convert blob to base64
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            const base64data = reader.result as string;
+            // Remove the data URL prefix
+            const base64Chunk = base64data.split(",")[1];
+
+            // Send chunk to server
+            this.socket?.emit("recordingChunk", {
+              appointmentId,
+              callId: this.callId,
+              chunk: base64Chunk,
+            });
+
+            this.currentRecordingSize += event.data.size;
+          };
+          reader.readAsDataURL(event.data);
+        }
+      };
+
+      // Start recording
+      this.mediaRecorder.start(1000); // Send chunks every second
+
+      // Notify server
+      this.socket.emit("startRecording", { appointmentId });
+    } catch (error) {
+      console.error("Error starting recording:", error);
+      if (this.onCallErrorCallback) {
+        this.onCallErrorCallback({
+          message: "Failed to start recording",
+        });
+      }
+    }
   }
 
   public stopRecording(appointmentId: string): void {
     if (!this.socket) return;
-    this.socket.emit("stopRecording", { appointmentId });
+
+    try {
+      if (this.mediaRecorder && this.mediaRecorder.state !== "inactive") {
+        this.mediaRecorder.stop();
+        this.mediaRecorder = null;
+      }
+
+      // Notify server
+      this.socket.emit("stopRecording", { appointmentId });
+    } catch (error) {
+      console.error("Error stopping recording:", error);
+      if (this.onCallErrorCallback) {
+        this.onCallErrorCallback({
+          message: "Failed to stop recording",
+        });
+      }
+    }
   }
 
   // Timeout methods
@@ -514,6 +607,14 @@ export class SocketService {
     this.callId = null;
     this.remoteDescSet = false;
     this.candidateQueue = [];
+
+    // Clean up recording
+    if (this.mediaRecorder && this.mediaRecorder.state !== "inactive") {
+      this.mediaRecorder.stop();
+      this.mediaRecorder = null;
+    }
+    this.recordingChunks = [];
+    this.currentRecordingSize = 0;
 
     // Don't disconnect the socket here as it might be used by other components
   }
